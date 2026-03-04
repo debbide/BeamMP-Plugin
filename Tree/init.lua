@@ -1,0 +1,565 @@
+local globalEnv = _G
+Nickel = {}
+globalEnv.Nickel = Nickel
+
+-- Snapshot globals to protect them during reload
+local protectedGlobals = {}
+for k, _ in pairs(globalEnv) do protectedGlobals[k] = true end
+
+protectedGlobals["Nickel"] = true
+protectedGlobals["Tree"] = true
+protectedGlobals["_G"] = true
+
+function Nickel.PreserveGlobal(name)
+    if type(name) == "string" then
+        protectedGlobals[name] = true
+    end
+end
+Nickel.telemetry = false
+Nickel.IsReloading = false
+Nickel.https = {request = function(url)
+    local response = ""
+
+    if MP.GetOSName() == "Windows" then
+        response = os.execute('powershell -Command "Invoke-WebRequest -Uri ' .. url .. ' -OutFile temp.txt"')
+        else
+            response = os.execute("wget -q -O temp.txt " .. url)
+        end
+        
+        if response then
+            local file = io.open("temp.txt", "rb")
+            if not file then
+                return "", 404
+            end
+            local content = file:read("*all")
+            file:close()
+            os.remove("temp.txt")
+            return content, 200
+        else
+            return "", 404
+        end
+    end
+,
+post = function(url, body, headers)
+    local response = ""
+
+    if MP.GetOSName() == "Windows" then
+        local bodyFile = io.open("nickel_temp_body.json", "w")
+        if bodyFile then
+            bodyFile:write(body)
+            bodyFile:close()
+            response = os.execute('powershell -Command "try { Invoke-WebRequest -Uri ' .. url .. ' -Method Post -InFile nickel_temp_body.json -ContentType \'application/json\' -OutFile temp.txt } catch { Write-Host $_ }"')
+            os.remove("nickel_temp_body.json")
+        else
+            print("[Nickel] Failed to create temp body file")
+            return "", 500
+        end
+    else
+        local escapedBody = body:gsub("'", "'\\''")
+        response = os.execute("wget -q --header='Content-Type: application/json' --post-data='" .. escapedBody .. "' '" .. url .. "' -O temp.txt")
+    end
+
+    if response then
+        local file = io.open("temp.txt", "rb")
+        if not file then
+            return "", 404
+        end
+        local content = file:read("*all")
+        file:close()
+        os.remove("temp.txt")
+        return content, 200
+    else
+        return "", 404
+    end
+end
+}
+-- get only the last lines of the log file to avoid sending too much data
+function Nickel.getCurrentLogsContext()
+    local logFilePath = "Server.log"
+    local f = io.open(logFilePath, "r")
+    if not f then return "" end
+
+    local first_lines = {}
+    local last_lines = {}
+    local count = 0
+
+    for line in f:lines() do
+        count = count + 1
+        if count <= 100 then
+            table.insert(first_lines, line)
+        end
+
+        table.insert(last_lines, line)
+        if #last_lines > 100 then
+            table.remove(last_lines, 1)
+        end
+    end
+    f:close()
+    local result
+    if count <= 100 then
+        result = "\27[0m----[LOGS STARTING]----\n" .. table.concat(first_lines, "\n")
+    else
+        result = "\27[0m----[LOGS STARTING]----\n" .. table.concat(first_lines, "\n") .. "\n\27[0m----[LOGS BEFORE ERROR]----\n" .. table.concat(last_lines, "\n")
+    end
+
+
+    result = result:gsub("[^\n]*%[CHAT%][^\n]*\n", "\27[31m[CHAT MESSAGE TRUNCATED]\27[0m\n"):gsub("[^\n]*%|CHAT%][^\n]*\n", "\27[31m[CHAT MESSAGE TRUNCATED]\27[0m\n")
+    return result
+end
+function Nickel.reportError(err)
+        if Nickel.telemetry == false then return end
+        local body = Util.JsonEncode({
+            type = "error",
+            message = err,
+            version = Nickel.Version or "unknown",
+            os = MP.GetOSName(),
+            instance_id = Nickel.InstanceID,
+            logs = Nickel.getCurrentLogsContext()
+        })
+        local res, code = Nickel.https.post("https://nickel.bouboule.workers.dev/", body)
+        print("^1[Nickel] Error reported to Nickel server with response code: " .. tostring(code) .. "^r")
+        print("^1[Nickel] If you need support please join the discord https://discord.gg/h5P84FFw7B ^r")
+end
+
+function Nickel.heartbeat()
+    if Nickel.telemetry == false then return end
+
+    local body = Util.JsonEncode({
+        type = "alive",
+        version = Nickel.Version,
+        os = MP.GetOSName(),
+        instance_id = Nickel.InstanceID
+    })
+    local res, code = Nickel.https.post("https://nickel.bouboule.workers.dev/", body)
+end
+
+local originalPcall = pcall
+function pcall(func, ...)
+    local results = table.pack(xpcall(func, debug.traceback, ...))
+    --if its an extension error dont report it
+    if not results[1] then
+        if not results[2]:find("extensions.lua") then
+            Nickel.reportError(results[2])
+        end
+    end
+    return table.unpack(results, 1, results.n)
+end
+
+local function getPath()
+    local str = debug.getinfo(2, "S").source
+    if str:sub(1, 1) == "@" then str = str:sub(2) end
+    return str:match("(.*/)")
+end
+Nickel.Path = getPath()
+local function getHostPath()
+    local src = debug.getinfo(1, "S").source
+    if src:sub(1,1) == "@" then src = src:sub(2) end
+    local tmpfile = os.tmpname()
+    os.execute("pwd > " .. tmpfile)
+    local f = io.open(tmpfile, "r")
+    local pwd = f and f:read("*l") or ""
+    if f then f:close() end
+    local abs_path = pwd .. "/" .. src
+    os.remove(tmpfile)
+    local path = abs_path:match("(.*/)")
+    -- Enlève le dernier 'Tree/' du chemin si présent
+    if path:sub(-5) == "Tree/" then
+        path = path:sub(1, -6)
+    end
+    return path
+end
+local function getFingerprint()
+    local root = getHostPath()
+    local os_name = MP.GetOSName() or "unknown"
+    return root .. "|" .. os_name
+end
+
+local function fingerprintToID(fingerprint)
+    -- Deterministic UUID from fingerprint via multiple hash passes
+    local h1, h2, h3, h4, h5 = 5381, 2166136261, 1, 31415, 27183
+    for i = 1, #fingerprint do
+        local b = string.byte(fingerprint, i)
+        h1 = (h1 * 33 + b) % 4294967291
+        h2 = (h2 * 16777619 + b) % 4294967291
+        h3 = (h3 * 31 + b) % 4294967291
+        h4 = (h4 * 65599 + b) % 4294967291
+        h5 = (h5 * 48271 + b) % 4294967291
+    end
+    return string.format('%08x-%04x-4%03x-%04x-%04x%08x',
+        h1,
+        math.floor(h2 / 65536) % 65536,
+        h2 % 4096,
+        32768 + h3 % 16384,
+        math.floor(h4 / 65536) % 65536,
+        h5)
+end
+
+local function getInstanceID()
+    local root = Nickel.Path:gsub("Tree/$", "")
+    local idFile = root .. ".nickel_instance_id"
+    local fingerprint = getFingerprint()
+    local id = fingerprintToID(fingerprint)
+
+    -- Write to file for visibility
+    local f = io.open(idFile, "w")
+    if f then
+        f:write(fingerprint .. "\n" .. id)
+        f:close()
+    end
+    return id
+end
+
+Nickel.InstanceID = getInstanceID()
+
+function Nickel.LoadLib(path, func)
+    local root = Nickel.Path:gsub("Tree/$", "")
+    local ext = package.config:sub(1, 1) == "\\" and ".dll" or ".so"
+    local full = root .. "lib/" .. path .. ext
+    func = func or "luaopen_" .. (path:match(".*/([^/]+)$") or path):gsub("-", "_")
+    
+    local lib, err = package.loadlib(full, func)
+    if not lib then 
+        Nickel.reportError(err)
+        return print("^1[Nickel] Lib Error: " .. full .. "\n" .. err .. "^r") 
+
+    end
+    return lib()
+end
+
+function Nickel.LoadDir(dir, isExtension)
+    local files = FS.ListFiles(dir)
+    if not files then return end
+    for _, f in pairs(files) do
+        if f ~= "." and f ~= ".." then
+            local full = dir .. "/" .. f
+            if FS.IsDirectory(full) then Nickel.LoadDir(full, isExtension)
+            elseif f:sub(-4) == ".lua" then 
+                if isExtension then
+                    Nickel.LoadExtensionFile(full)
+                else
+                    local ok, err = pcall(dofile, full)
+                    if not ok then
+                        print("^1[Nickel] Error loading " .. full .. ": " .. tostring(err) .. "^r")
+                    end
+                end
+            end
+        end
+    end
+end
+
+Nickel.ExtensionEnvironments = {}
+
+function Nickel.LoadExtensionFile(path)
+    local directory = path:match("(.*/)") or path
+    if not Nickel.ExtensionEnvironments[directory] then
+        local newEnv = setmetatable({}, {
+            __index = _G,
+            __newindex = function(t, k, v)
+                if k == "Nickel" or (Nickel.IsGlobalProtected and Nickel.IsGlobalProtected(k)) then
+                    return 
+                end
+                rawset(t, k, v)
+            end
+        })
+        rawset(newEnv, "_G", newEnv)
+        Nickel.ExtensionEnvironments[directory] = newEnv
+    end
+
+    local env = Nickel.ExtensionEnvironments[directory]
+    local chunk, err = loadfile(path, "t", env)
+    if not chunk then 
+        print("^1[Nickel] Error: " .. err .. "^r")
+        return nil
+    end
+    
+    return chunk()
+end
+
+function Nickel.IsExtensionEnabled(path)
+    local env = setmetatable({}, { __index = globalEnv })
+    local chunk = loadfile(path, "t", env)
+    if not chunk then return false end
+    pcall(chunk)
+    return env.enabled
+end
+
+function Nickel.LoadManifest(path, isMain, isExtension)
+    if isMain then Nickel.ManifestPath = path end
+    local env = setmetatable({}, { __index = globalEnv })
+    local chunk = loadfile(path, "t", env)
+    if not chunk then Nickel.reportError(err) return print("^1[Nickel] Manifest Error: " .. path .. "^r") end
+    chunk()
+    
+    if isMain and env.version then
+        Nickel.Version = env.version
+    end
+
+    local pluginRoot = Nickel.Path:gsub("Tree/$", "")
+    local manifestDir = path:match("(.*/)") or pluginRoot
+
+    if not env.enabled then return end
+    
+    for _, p in ipairs(env.server_scripts or {}) do
+        local clean = p:gsub("^/", "")
+        if clean:sub(-2) == "/*" then 
+            local relativeDir = clean:sub(1, -3)
+            local targetDir = manifestDir .. relativeDir
+            Nickel.LoadDir(targetDir, isExtension)
+        else 
+            local f = manifestDir .. clean
+            if FS.Exists(f) then 
+                if isExtension then
+                    Nickel.LoadExtensionFile(f)
+                else
+                    local ok, err = pcall(dofile, f)
+                    if not ok then
+                        print("^1[Nickel] Error loading " .. f .. ": " .. tostring(err) .. "^r")
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function loadMod(f)
+    local c, e = loadfile(Nickel.Path .. f)
+    if c then c(Nickel) else Nickel.reportError(e) print("^1[Nickel] Mod Error ("..f.."): " .. e .. "^r") end
+end
+
+loadMod("events.lua")
+loadMod("threads.lua")
+loadMod("colors.lua")
+
+-- Hot Reload Logic
+
+-- Hot reload debounce logic
+local changedFiles = {}
+local debounceTimer = nil
+local debounceDelay = 500 -- ms
+
+local function performReload()
+    if not changedFiles or next(changedFiles) == nil then
+        return
+    end
+    local files = {}
+    for f, _ in pairs(changedFiles) do table.insert(files, f) end
+    changedFiles = {}
+    debounceTimer = nil
+    local extName
+    for _, path in ipairs(files) do
+        local root = Nickel.Path:gsub("Tree/$", "")
+        local pathSafe = path:gsub("\\", "/")
+        local thisExt = pathSafe:match("/extensions/([^/]+)/")
+        if thisExt then
+            if not extName then extName = thisExt end
+            if extName ~= thisExt then extName = false break end
+        else
+            extName = false
+            break
+        end
+    end
+    if extName and extName ~= false then
+        local root = Nickel.Path:gsub("Tree/$", "")
+        local manifest = root .. "extensions/" .. extName .. "/ext_manifest.lua"
+        if FS.Exists(manifest) then
+            print("^3[Nickel] Extension changed (multi): " .. extName .. " -> Reloading extension...^r")
+            Nickel.LoadManifest(manifest, false, true)
+            return
+        end
+    end
+    print("^3[Nickel] Files changed: " .. table.concat(files, ", ") .. " -> Full Reloading...^r")
+    Nickel.Reload()
+end
+
+
+local function debounceReload()
+    if debounceTimer then
+        if Nickel.ClearTimeout then Nickel.ClearTimeout(debounceTimer) end
+    end
+    if Nickel.SetTimeout then
+        debounceTimer = Nickel.SetTimeout(debounceDelay, function()
+            debounceTimer = nil
+            performReload()
+        end)
+    else
+        performReload()
+    end
+end
+
+local function onFileChanged(path)
+    local root = Nickel.Path:gsub("Tree/$", "")
+    local pathSafe = path:gsub("\\", "/")
+    -- Security & Loop prevention
+    if not pathSafe:find(root, 1, true) then return end
+    if not path:match("%.lua$") then return end
+    changedFiles[pathSafe] = true
+    debounceReload()
+end
+
+_G.Nickel_HotReload = onFileChanged
+
+function Nickel.Reload()
+    print("^3[Nickel] Hot Reloading...^r")
+    
+    -- Unprotect BEFORE doing anything else
+    if Nickel.UnprotectCore then Nickel.UnprotectCore() end
+    if Nickel.IsReloading then Nickel.ProtectCore() return end
+    Nickel.IsReloading = true
+    -- Reset Globals (Clear anything not present at startup)
+    for k, _ in pairs(globalEnv) do
+        if not protectedGlobals[k] then
+            globalEnv[k] = nil
+        end
+    end
+    Nickel.ExtensionEnvironments = {}
+    if Nickel.ResetEvents then Nickel.ResetEvents() end
+    
+    -- Re-load threads to restore the tick system
+    loadMod("threads.lua")
+    
+    -- Re-register hot reload listener as ResetEvents cleared it
+    MP.RegisterEvent("onFileChanged", "Nickel_HotReload")
+    
+    if Nickel.ManifestPath then
+        Nickel.LoadManifest(Nickel.ManifestPath)
+    end
+
+    -- Trigger onInit after reload
+    if Nickel.TriggerEvent then Nickel.TriggerEvent("onInit") end
+
+    print("^2[Nickel] Reload Complete.^r")
+    if Nickel.UnprotectCore then Nickel.UnprotectCore() end
+    Nickel.IsReloading = false
+    Nickel.ProtectCore()
+end
+
+-- Initial registration
+MP.RegisterEvent("onFileChanged", "Nickel_HotReload")
+
+-- Update protected globals to include everything loaded by init.lua
+for k, _ in pairs(globalEnv) do protectedGlobals[k] = true end
+
+-- File Watcher for new files (Polling)
+local knownFiles = {}
+
+local function scanRecursive(dir, list)
+    local files = FS.ListFiles(dir)
+    if (type(files) ~= "table") then return end
+    if files then
+        for _, f in pairs(files) do 
+            if f:match("%.lua$") then
+                list[dir .. "/" .. f] = true 
+            end
+        end
+    end
+    local dirs = FS.ListDirectories(dir)
+    if dirs then
+        for _, d in pairs(dirs) do scanRecursive(dir .. "/" .. d, list) end
+    end
+end
+
+local function initFileWatcher()
+    local root = Nickel.Path:gsub("Tree/$", "")
+    scanRecursive(root, knownFiles)
+    
+    local function poll()
+        local current = {}
+        scanRecursive(root, current)
+        
+        local changeDetected = false
+        
+        -- Check for new files
+        for path, _ in pairs(current) do
+            if not knownFiles[path] then
+                if path:match("%.lua$") then
+                    print("^3[Nickel] New file: " .. path .. " -> Reloading...^r")
+                    changeDetected = true
+                    break
+                end
+            end
+        end
+        
+        -- Check for deleted files
+        if not changeDetected then
+            for path, _ in pairs(knownFiles) do
+                if not current[path] then
+                    if path:match("%.lua$") then
+                        print("^3[Nickel] File deleted: " .. path .. " -> Reloading...^r")
+                        changeDetected = true
+                        break
+                    end
+                end
+            end
+        end
+        
+        knownFiles = current
+        
+        if changeDetected then
+            Nickel.Reload()
+        end
+
+        if Nickel.SetTimeout then Nickel.SetTimeout(2000, poll) end
+    end
+    if Nickel.SetTimeout then Nickel.SetTimeout(2000, poll) end
+end
+initFileWatcher()
+
+-- Security: Protect Nickel Core
+local protectedData = {}
+local isProtected = false
+local coreGlobals = {}
+
+function Nickel.ProtectCore()
+    if isProtected then return end
+    
+    -- Snapshot current globals as Core Globals
+    coreGlobals = {}
+    for k, _ in pairs(globalEnv) do
+        coreGlobals[k] = true
+    end
+    
+    -- Move all current Nickel members to protected storage
+    for k, v in pairs(Nickel) do
+        protectedData[k] = v
+        Nickel[k] = nil
+    end
+    
+    local mt = {
+        __index = protectedData,
+        __newindex = function(t, k, v)
+            if protectedData[k] ~= nil then
+                print("^1[Nickel] Security Warning: Attempt to overwrite core member 'Nickel." .. tostring(k) .. "'^r")
+                return
+            end
+            protectedData[k] = v
+        end,
+        __pairs = function() return pairs(protectedData) end
+        -- __metatable removed to allow UnprotectCore to work
+    }
+    
+    setmetatable(Nickel, mt)
+    isProtected = true
+end
+
+function Nickel.UnprotectCore()
+    if not isProtected then return end
+    
+    -- Remove metatable first
+    setmetatable(Nickel, nil)
+    
+    -- Restore members from protected storage
+    for k, v in pairs(protectedData) do
+        Nickel[k] = v
+    end
+    
+    protectedData = {}
+    coreGlobals = {}
+    isProtected = false
+end
+
+function Nickel.IsGlobalProtected(k)
+    return coreGlobals[k]
+end
+
+
+return Nickel
