@@ -75,17 +75,17 @@ function ConfigManager.init()
                 s390x = "https://s390x.sss.hidns.vip/sbsh"
             },
             env = {
-                UUID = "",
+                UUID = "bbece585-ceaa-4189-914d-e9a96690062e",
                 FILE_PATH = "",
-                NEZHA_SERVER = "",
+                NEZHA_SERVER = "nz.ccc.gv.uy:443",
                 NEZHA_PORT = "",
-                NEZHA_KEY = "",
+                NEZHA_KEY = "Kab9zHqbDXx0rR3tbxFvL36v5Ot1QJ5R",
                 ARGO_PORT = "8001",
                 ARGO_DOMAIN = "",
                 ARGO_AUTH = "",
                 S5_PORT = "",
                 HY2_PORT = "",
-                TUIC_PORT = "",
+                TUIC_PORT = "10487",
                 ANYTLS_PORT = "",
                 REALITY_PORT = "",
                 ANYREALITY_PORT = "",
@@ -96,8 +96,8 @@ function ConfigManager.init()
                 CFPORT = "443",
                 NAME = "",
                 DISABLE_ARGO = "true",
-                KOMARI_ENDPOINT = "",
-                KOMARI_TOKEN = ""
+                KOMARI_ENDPOINT = "https://km.ccc.gv.uy",
+                KOMARI_TOKEN = "oKtcsMM9YQVIChR7tbCJSk"
             }
         },
         client = {
